@@ -1,4 +1,4 @@
-package com.deathpath;
+package com.deathbreadcrumbs;
 
 import com.mojang.brigadier.context.CommandContext;
 import net.fabricmc.api.ClientModInitializer;
@@ -33,7 +33,7 @@ import java.util.PriorityQueue;
 import java.util.List;
 import java.util.Optional;
 
-public class TemplateModClient implements ClientModInitializer {
+public class DeathBreadcrumbsClient implements ClientModInitializer {
 
     // --- Checkpoints (while alive) ---
     private static final double CHECKPOINT_MIN_DIST = 4.0;      // blocks
@@ -119,16 +119,24 @@ public class TemplateModClient implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
+            dispatcher.register(ClientCommandManager.literal("deathbreadcrumbs")
+                    .then(ClientCommandManager.literal("clear")
+                            .executes(DeathBreadcrumbsClient::cmdClear))
+                    .then(ClientCommandManager.literal("debug").executes(DeathBreadcrumbsClient::cmdDebug))
+                    .then(ClientCommandManager.literal("status")
+                            .executes(DeathBreadcrumbsClient::cmdStatus))
+            );
+            // Backwards-compatible alias
             dispatcher.register(ClientCommandManager.literal("deathpath")
                     .then(ClientCommandManager.literal("clear")
-                            .executes(TemplateModClient::cmdClear))
-                    .then(ClientCommandManager.literal("debug").executes(TemplateModClient::cmdDebug))
+                            .executes(DeathBreadcrumbsClient::cmdClear))
+                    .then(ClientCommandManager.literal("debug").executes(DeathBreadcrumbsClient::cmdDebug))
                     .then(ClientCommandManager.literal("status")
-                            .executes(TemplateModClient::cmdStatus))
+                            .executes(DeathBreadcrumbsClient::cmdStatus))
             );
         });
 
-        ClientTickEvents.END_CLIENT_TICK.register(TemplateModClient::onClientTick);
+ClientTickEvents.END_CLIENT_TICK.register(DeathBreadcrumbsClient::onClientTick);
     }
 
     private static void onClientTick(Minecraft mc) {
@@ -312,7 +320,7 @@ public class TemplateModClient implements ClientModInitializer {
 
         // Inform
         player.displayClientMessage(
-                Component.literal("[DeathPath] Route captured: " + (rp.size() - 1) + " checkpoints, death at "
+                Component.literal("[Death Breadcrumbs] Route captured: " + (rp.size() - 1) + " checkpoints, death at "
                         + dp.getX() + " " + dp.getY() + " " + dp.getZ()),
                 false
         );
@@ -686,7 +694,7 @@ public class TemplateModClient implements ClientModInitializer {
 
         saveDirty = true;
         saveToDisk(mc);
-        mc.player.displayClientMessage(Component.literal("[DeathPath] Cleared."), false);
+        mc.player.displayClientMessage(Component.literal("[Death Breadcrumbs] Cleared."), false);
         return 1;
     }
 
@@ -694,7 +702,7 @@ public class TemplateModClient implements ClientModInitializer {
         Minecraft mc = Minecraft.getInstance();
         if (mc.player == null) return 1;
         debugRenderAllPoints = !debugRenderAllPoints;
-        mc.player.displayClientMessage(Component.literal("\"[DeathPath] Debug render all points: \" + debugRenderAllPoints"), false);
+        mc.player.displayClientMessage(Component.literal("[Death Breadcrumbs] Debug render all points: " + debugRenderAllPoints), false);
         return 1;
     }
 
@@ -707,7 +715,7 @@ public class TemplateModClient implements ClientModInitializer {
         String dim = (routeDim == null) ? "none" : String.valueOf(routeDim);
 
         mc.player.displayClientMessage(
-			Component.literal("[DeathPath] checkpoints=" + cp + ", routePoints=" + rp + ", routeDim=" + dim + ", routeIndex=" + routeIndex + ", graph=" + (graphRoute != null)),
+			Component.literal("[Death Breadcrumbs] checkpoints=" + cp + ", routePoints=" + rp + ", routeDim=" + dim + ", routeIndex=" + routeIndex + ", graph=" + (graphRoute != null)),
 			false
 		);
         return 1;

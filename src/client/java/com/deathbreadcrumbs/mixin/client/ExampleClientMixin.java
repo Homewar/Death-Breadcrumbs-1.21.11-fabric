@@ -1,4 +1,4 @@
-package com.deathpath.mixin.client;
+package com.deathbreadcrumbs.mixin.client;
 
 import net.minecraft.client.Minecraft;
 import org.spongepowered.asm.mixin.Mixin;

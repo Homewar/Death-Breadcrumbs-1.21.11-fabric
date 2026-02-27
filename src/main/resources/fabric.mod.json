@@ -1,38 +1,37 @@
 {
-	"schemaVersion": 1,
-	"id": "template-mod",
-	"version": "${version}",
-	"name": "Template Mod",
-	"description": "This is an example description! Tell everyone what your mod is about!",
-	"authors": [
-		"Me!"
-	],
-	"contact": {
-		"homepage": "https://fabricmc.net/",
-		"sources": "https://github.com/FabricMC/fabric-example-mod"
-	},
-	"license": "CC0-1.0",
-	"icon": "assets/template-mod/icon.png",
-	"environment": "*",
-	"entrypoints": {
-		"main": [
-			"com.deathpath.TemplateMod"
-		],
-		"client": [
-			"com.deathpath.TemplateModClient"
-		]
-	},
-	"mixins": [
-		"template-mod.mixins.json",
-		{
-			"config": "template-mod.client.mixins.json",
-			"environment": "client"
-		}
-	],
-	"depends": {
-		"fabricloader": ">=0.18.4",
-		"minecraft": "~1.21.11",
-		"java": ">=21",
-		"fabric-api": "*"
-	}
+  "schemaVersion": 1,
+  "id": "deathbreadcrumbs",
+  "version": "${version}",
+  "name": "Death Breadcrumbs",
+  "description": "Shows a breadcrumb particle trail back to your last death location.",
+  "authors": [
+    "deathbreadcrumbs"
+  ],
+  "contact": {
+    "sources": "https://example.invalid"
+  },
+  "license": "CC0-1.0",
+  "icon": "assets/deathbreadcrumbs/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.deathbreadcrumbs.DeathBreadcrumbs"
+    ],
+    "client": [
+      "com.deathbreadcrumbs.DeathBreadcrumbsClient"
+    ]
+  },
+  "mixins": [
+    "deathbreadcrumbs.mixins.json",
+    {
+      "config": "deathbreadcrumbs.client.mixins.json",
+      "environment": "client"
+    }
+  ],
+  "depends": {
+    "fabricloader": ">=0.18.4",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
 }

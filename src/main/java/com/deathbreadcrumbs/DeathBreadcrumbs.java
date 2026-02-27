@@ -1,12 +1,12 @@
-package com.deathpath;
+package com.deathbreadcrumbs;
 
 import net.fabricmc.api.ModInitializer;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class TemplateMod implements ModInitializer {
-	public static final String MOD_ID = "template-mod";
+public class DeathBreadcrumbs implements ModInitializer {
+	public static final String MOD_ID = "deathbreadcrumbs";
 
 	// This logger is used to write text to the console and the log file.
 	// It is considered best practice to use your mod id as the logger's name.
