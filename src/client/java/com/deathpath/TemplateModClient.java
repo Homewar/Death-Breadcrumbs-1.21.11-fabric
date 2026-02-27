@@ -75,6 +75,10 @@ public class TemplateModClient implements ClientModInitializer {
     // Helps capture route once per death
     private static GlobalPos lastCapturedDeath = null;
 
+    private static long lastCapturedDeathTick = -1;
+
+    // Debug: render all checkpoints (including history)
+    private static boolean debugRenderAllPoints = false;
     // Detect the exact moment of death so we don't pollute the route with checkpoints
     // from the new life (respawn).
     private static boolean wasAliveLastTick = true;
@@ -89,6 +93,15 @@ public class TemplateModClient implements ClientModInitializer {
 
     // Don't render crumbs too close to the player camera (avoids "in your face" particles)
     private static final double CRUMB_MIN_RENDER_DIST = 2.0; // blocks
+
+    // If the player cuts corners / goes off-route, the closest graph node may be far away and crumbs "disappear".
+    // When that happens, we inject temporary "bridge" nodes near the player so the graph stays connected.
+    private static final double OFF_ROUTE_DIST = 12.0;      // XZ distance from nearest graph node to consider "lost"
+    private static final double BRIDGE_STEP_DIST = 5.0;     // minimum XZ distance between bridge nodes
+    private static final int BRIDGE_MIN_TICKS = 10;         // minimum ticks between bridge nodes
+
+    private static Vec3 lastBridgePos = null;
+    private static long lastBridgeTick = 0;
 
     // When close enough to the death point, hide breadcrumbs.
     private static final double DEATH_HIDE_RADIUS = 6.0; // blocks
@@ -109,6 +122,7 @@ public class TemplateModClient implements ClientModInitializer {
             dispatcher.register(ClientCommandManager.literal("deathpath")
                     .then(ClientCommandManager.literal("clear")
                             .executes(TemplateModClient::cmdClear))
+                    .then(ClientCommandManager.literal("debug").executes(TemplateModClient::cmdDebug))
                     .then(ClientCommandManager.literal("status")
                             .executes(TemplateModClient::cmdStatus))
             );
@@ -163,6 +177,11 @@ public class TemplateModClient implements ClientModInitializer {
 
         // 4) Draw breadcrumbs (short trail ahead)
         renderBreadcrumbs(level, player);
+
+        // 5) Debug: render all stored checkpoints
+        if (debugRenderAllPoints) {
+            renderAllCheckpoints(level, player);
+        }
 
         wasAliveLastTick = alive;
     }
@@ -226,11 +245,20 @@ public class TemplateModClient implements ClientModInitializer {
 
         GlobalPos gp = opt.get();
 
-        // Same death already captured
-        if (lastCapturedDeath != null
+        // Same death already captured very recently: ignore to avoid re-capture loops.
+        // But allow capturing again if you die again at the same spot later.
+        boolean sameDeath = lastCapturedDeath != null
                 && lastCapturedDeath.pos().equals(gp.pos())
-                && lastCapturedDeath.dimension().equals(gp.dimension())) {
-            return;
+                && lastCapturedDeath.dimension().equals(gp.dimension());
+
+        if (sameDeath) {
+            long tickNow = (mc.level != null) ? mc.level.getGameTime() : -1;
+            if (tickNow >= 0 && lastCapturedDeathTick >= 0 && (tickNow - lastCapturedDeathTick) < 40) { // ~2s
+                pendingDeathCapture = false;
+                checkpointsSnapshot = null;
+                checkpointsSnapshotDim = null;
+                return;
+            }
         }
 
         // Capture route: checkpoints (from the life that ended) + exact death position (center of block)
@@ -272,6 +300,7 @@ public class TemplateModClient implements ClientModInitializer {
         graphRoute = GraphRoute.build(rp);
 
         lastCapturedDeath = gp;
+        lastCapturedDeathTick = (mc.level != null) ? mc.level.getGameTime() : lastCapturedDeathTick;
 
         pendingDeathCapture = false;
         checkpointsSnapshot = null;
@@ -306,6 +335,54 @@ public class TemplateModClient implements ClientModInitializer {
 
         // If we are already close to the death point, hide breadcrumbs.
         if (distXZ(me, deathPos) <= DEATH_HIDE_RADIUS) return;
+
+        // If the player deviated far from the recorded trail (cut corners, teleported locally, etc.),
+        // add a "bridge" node near the player and rebuild the graph so breadcrumbs remain visible.
+        if (graphRoute != null && routePoints != null && routePoints.size() >= 2) {
+            Vec3 nearest = graphRoute.nodes.get(findClosestIndex(graphRoute.nodes, me));
+            double dNearest = distXZ(me, nearest);
+            long tickNow = level.getGameTime();
+
+            boolean far = dNearest > OFF_ROUTE_DIST;
+            boolean stepped = (lastBridgePos == null) || (distXZ(me, lastBridgePos) >= BRIDGE_STEP_DIST);
+            boolean cooldown = (tickNow - lastBridgeTick) >= BRIDGE_MIN_TICKS;
+
+            if (far && stepped && cooldown) {
+                Vec3 bridge = new Vec3(me.x, me.y, me.z);
+
+                // Insert right before death node (death is always the last node).
+                int insertAt = Math.max(0, routePoints.size() - 1);
+                routePoints.add(insertAt, bridge);
+
+                // Locally collapse duplicates near the insertion to avoid spam.
+                routePoints = simplifyClosePoints(routePoints, CHECKPOINT_MERGE_DIST);
+
+                // Rebuild graph so pathFrom() starts near the player again.
+                graphRoute = GraphRoute.build(routePoints);
+
+                // Also keep the checkpoint history for future deaths (same dimension only).
+                if (routeDim != null) {
+                    if (checkpointsDim == null) checkpointsDim = routeDim;
+                    if (checkpointsDim.equals(routeDim)) {
+                    if (!checkpoints.isEmpty() && distXZ(checkpoints.get(checkpoints.size() - 1), bridge) <= CHECKPOINT_MERGE_DIST) {
+                        checkpoints.set(checkpoints.size() - 1, bridge);
+                    } else {
+                        checkpoints.add(bridge);
+                    }
+                    // cap
+                    while (checkpoints.size() > CHECKPOINT_MAX_COUNT) {
+                        checkpoints.remove(0);
+                        checkpointSegmentStart = Math.max(0, checkpointSegmentStart - 1);
+                    }
+                    saveDirty = true;
+                    }
+                }
+
+                lastBridgePos = bridge;
+                lastBridgeTick = tickNow;
+            }
+        }
+
 
         // Preferred: graph-based shortest path over "support points".
         if (graphRoute != null) {
@@ -382,6 +459,23 @@ public class TemplateModClient implements ClientModInitializer {
         level.addParticle(ParticleTypes.END_ROD, x, y, z, 0, 0, 0);
     }
 
+
+    private static void renderAllCheckpoints(Level level, LocalPlayer player) {
+        if (checkpointsDim == null) return;
+        if (!level.dimension().equals(checkpointsDim)) return;
+        int n = checkpoints.size();
+        if (n <= 0) return;
+
+        // Avoid spawning an extreme amount of particles each tick.
+        final int maxPerTick = 600;
+        int stride = Math.max(1, n / maxPerTick);
+
+        for (int i = 0; i < n; i += stride) {
+            Vec3 p = checkpoints.get(i);
+            spawnCrumb(level, p);
+        }
+    }
+
     // Intentionally no alive checkpoint rendering.
 
 
@@ -398,6 +492,8 @@ public class TemplateModClient implements ClientModInitializer {
         routeDim = null;
         routeIndex = 0;
         graphRoute = null;
+        lastBridgePos = null;
+        lastBridgeTick = 0;
         // We keep lastCapturedDeath so we don't re-capture the same death over and over.
 
         // Soft-reset the checkpoint segment so very old trails don't interfere with the next death route.
@@ -591,6 +687,14 @@ public class TemplateModClient implements ClientModInitializer {
         saveDirty = true;
         saveToDisk(mc);
         mc.player.displayClientMessage(Component.literal("[DeathPath] Cleared."), false);
+        return 1;
+    }
+
+    private static int cmdDebug(CommandContext<?> ctx) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null) return 1;
+        debugRenderAllPoints = !debugRenderAllPoints;
+        mc.player.displayClientMessage(Component.literal("\"[DeathPath] Debug render all points: \" + debugRenderAllPoints"), false);
         return 1;
     }
 
