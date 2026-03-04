@@ -26,10 +26,10 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.Vec3;
 
+import com.deathbreadcrumbs.nav.PointDatabase;
+import com.deathbreadcrumbs.nav.PointId;
+
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Comparator;
-import java.util.PriorityQueue;
 import java.util.List;
 import java.util.Optional;
 
@@ -54,6 +54,15 @@ public class DeathBreadcrumbsClient implements ClientModInitializer {
     // but are ignored when capturing a death route (prevents "crooked" routes from ancient trails).
     private static int checkpointSegmentStart = 0;
 
+    // --- New: global point DB for future marker API ---
+    private static final PointDatabase POINT_DB = new PointDatabase(
+            32, // CELL_SIZE
+            CHECKPOINT_MERGE_DIST,
+            2048 // max backwalk for cycle checks
+    );
+    private static long checkpointSegmentId = 1;
+    private static PointId lastDbPointId = null;
+
     // --- Persistence ---
     private static final String SAVE_DIR_NAME = "deathpath";
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
@@ -63,18 +72,28 @@ public class DeathBreadcrumbsClient implements ClientModInitializer {
 
 
     // --- Route (after death) ---
-    private static List<Vec3> routePoints = null; // kept for /status and debug
-    private static ResourceKey<Level> routeDim = null;
+    private static final class DeathRoute {
+        final List<Vec3> points; // last point is the death position
+        final ResourceKey<Level> dim;
+        final GraphRoute graph;
+        final GlobalPos death;
+        int routeIndex; // legacy/fallback status
 
-    // Graph-based routing: from current position -> nearest node -> ... -> death
-    private static GraphRoute graphRoute = null;
+        DeathRoute(List<Vec3> points, ResourceKey<Level> dim, GraphRoute graph, GlobalPos death) {
+            this.points = points;
+            this.dim = dim;
+            this.graph = graph;
+            this.death = death;
+            this.routeIndex = 0;
+        }
+    }
 
-    // Legacy index (kept for status; not used when graphRoute != null)
-    private static int routeIndex = 0;
+    // Queue of outstanding deaths (first = highest priority).
+    private static final java.util.ArrayDeque<DeathRoute> deathQueue = new java.util.ArrayDeque<>();
+    private static DeathRoute activeRoute = null;
 
     // Helps capture route once per death
     private static GlobalPos lastCapturedDeath = null;
-
     private static long lastCapturedDeathTick = -1;
 
     // Debug: render all checkpoints (including history)
@@ -86,31 +105,33 @@ public class DeathBreadcrumbsClient implements ClientModInitializer {
     private static ArrayList<Vec3> checkpointsSnapshot = null;
     private static ResourceKey<Level> checkpointsSnapshotDim = null;
 
+    // Track last known alive position to make sure the captured route always includes the final approach.
+    private static Vec3 lastAlivePos = null;
+    private static ResourceKey<Level> lastAliveDim = null;
+
     // --- Breadcrumbs rendering ---
     private static final int CRUMBS_COUNT = 18;        // how many crumbs to show
-    private static final double CRUMB_Y_OFF = 0.15;    // lift above ground
+    private static final double CRUMB_Y_OFF = 0.25;    // lift above ground    // lift above ground
     private static final double ADVANCE_DIST = 2.2;    // when "reached" a waypoint
 
     // Don't render crumbs too close to the player camera (avoids "in your face" particles)
     private static final double CRUMB_MIN_RENDER_DIST = 2.0; // blocks
-
-    // If the player cuts corners / goes off-route, the closest graph node may be far away and crumbs "disappear".
-    // When that happens, we inject temporary "bridge" nodes near the player so the graph stays connected.
-    private static final double OFF_ROUTE_DIST = 12.0;      // XZ distance from nearest graph node to consider "lost"
-    private static final double BRIDGE_STEP_DIST = 5.0;     // minimum XZ distance between bridge nodes
-    private static final int BRIDGE_MIN_TICKS = 10;         // minimum ticks between bridge nodes
-
-    private static Vec3 lastBridgePos = null;
-    private static long lastBridgeTick = 0;
 
     // When close enough to the death point, hide breadcrumbs.
     private static final double DEATH_HIDE_RADIUS = 6.0; // blocks
     // When the player reaches the death point, clear the route and resume recording checkpoints.
     private static final double DEATH_REACHED_RADIUS = 3.0; // blocks
 
+    // --- Goal marker (death point) ---
+    // "Bad Omen"-like swirling particles so the final target is always visible.
+    private static final int GOAL_PARTICLES_PER_TICK = 6;
+    private static final double GOAL_RING_RADIUS = 0.75;
+    // Roughly matches the Bad Omen tint (dark teal/green).
+    private static final double GOAL_R = 0.05;
+    private static final double GOAL_G = 0.22;
+    private static final double GOAL_B = 0.20;
+
     // Graph params ("опорные точки")
-    private static final int GRAPH_K_NEIGHBORS = 6;          // connect each node to K nearest
-    private static final double GRAPH_MAX_EDGE_DIST = 40.0;  // don't connect very far nodes (blocks)
 
 
     // While alive we keep recording checkpoints, but we don't render them.
@@ -162,6 +183,12 @@ ClientTickEvents.END_CLIENT_TICK.register(DeathBreadcrumbsClient::onClientTick);
 
         boolean alive = player.isAlive();
 
+        // Keep last alive position for better death capture.
+        if (alive) {
+            lastAlivePos = player.position();
+            lastAliveDim = level.dimension();
+        }
+
         // 1) Detect transition alive -> dead and snapshot checkpoints from the life that ended.
         if (!alive && wasAliveLastTick) {
             pendingDeathCapture = true;
@@ -169,6 +196,19 @@ ClientTickEvents.END_CLIENT_TICK.register(DeathBreadcrumbsClient::onClientTick);
             int start = Math.max(0, Math.min(checkpointSegmentStart, checkpoints.size()));
             checkpointsSnapshot = new ArrayList<>(checkpoints.subList(start, checkpoints.size()));
             checkpointsSnapshotDim = checkpointsDim;
+
+            // Ensure the last alive position is included even if checkpoint throttling skipped it.
+            if (lastAlivePos != null && lastAliveDim != null && checkpointsSnapshotDim != null
+                    && checkpointsSnapshotDim.equals(lastAliveDim)) {
+                if (checkpointsSnapshot.isEmpty()) {
+                    checkpointsSnapshot.add(lastAlivePos);
+                } else {
+                    Vec3 last = checkpointsSnapshot.get(checkpointsSnapshot.size() - 1);
+                    if (lastAlivePos.distanceTo(last) > (CHECKPOINT_MERGE_DIST * 0.5)) {
+                        checkpointsSnapshot.add(lastAlivePos);
+                    }
+                }
+            }
         }
 
         // 2) Capture death route using vanilla lastDeathLocation.
@@ -178,8 +218,9 @@ ClientTickEvents.END_CLIENT_TICK.register(DeathBreadcrumbsClient::onClientTick);
         // 3) While alive: place checkpoints ONLY if we are NOT returning to a death point.
         //    Important: right after respawn the route may not be captured yet (pendingDeathCapture),
         //    but we still must NOT record new checkpoints because it confuses the death route.
-        if (alive && !isReturningToDeath()) {
-            // Record support points silently.
+        if (alive) {
+            // Record support points silently (even while returning).
+            // Route capture uses a snapshot taken at death, so recording now does not pollute the route.
             maybeAddCheckpoint(level, player);
         }
 
@@ -201,6 +242,10 @@ ClientTickEvents.END_CLIENT_TICK.register(DeathBreadcrumbsClient::onClientTick);
             lastCheckpointPos = null;
             lastCheckpointTick = 0;
             checkpointSegmentStart = 0;
+
+            // New segment for the DB as well.
+            checkpointSegmentId++;
+            lastDbPointId = null;
         }
 
         checkpointsDim = level.dimension();
@@ -213,6 +258,15 @@ ClientTickEvents.END_CLIENT_TICK.register(DeathBreadcrumbsClient::onClientTick);
                 saveDirty = true;
             lastCheckpointPos = pos;
             lastCheckpointTick = tick;
+
+            // Record to the DB with merge + cycle-safe linking.
+            lastDbPointId = POINT_DB.addOrMerge(
+                    keyId(level.dimension()),
+                    pos,
+                    lastDbPointId,
+                    checkpointSegmentId,
+                    tick
+            );
             return;
         }
 
@@ -228,6 +282,15 @@ ClientTickEvents.END_CLIENT_TICK.register(DeathBreadcrumbsClient::onClientTick);
                 checkpoints.add(pos);
                 saveDirty = true;
             }
+
+            // Record to the DB with merge + cycle-safe linking.
+            lastDbPointId = POINT_DB.addOrMerge(
+                    keyId(level.dimension()),
+                    pos,
+                    lastDbPointId,
+                    checkpointSegmentId,
+                    tick
+            );
 
             // Rolling buffer: prevent unbounded growth.
             if (checkpoints.size() > CHECKPOINT_MAX_COUNT) {
@@ -247,6 +310,12 @@ ClientTickEvents.END_CLIENT_TICK.register(DeathBreadcrumbsClient::onClientTick);
 
     private static void tryCaptureDeathRoute(Minecraft mc, LocalPlayer player) {
         if (!pendingDeathCapture) return;
+
+        // IMPORTANT:
+        // On the client, player.getLastDeathLocation() may still point to the *previous* death
+        // while the player is on the death screen. It reliably updates after respawn.
+        // Capturing too early produces a death marker in the wrong place.
+        if (!player.isAlive()) return;
 
         Optional<GlobalPos> opt = player.getLastDeathLocation();
         if (opt.isEmpty()) return;
@@ -282,30 +351,22 @@ ClientTickEvents.END_CLIENT_TICK.register(DeathBreadcrumbsClient::onClientTick);
         }
 
         // Ensure direction is RESPAWN -> ... -> DEATH.
-        // If the checkpoints we collected happen to be ordered the other way around,
-        // flip them so the last checkpoint is closest to the death position.
-        if (rp.size() >= 2) {
-            int lastCpIdx = rp.size() - 1;
-            Vec3 firstCp = rp.get(0);
-            Vec3 lastCp = rp.get(lastCpIdx);
-            double dFirst = firstCp.distanceTo(deathPos);
-            double dLast = lastCp.distanceTo(deathPos);
-            if (dFirst < dLast) {
-                java.util.Collections.reverse(rp);
-            }
-        }
+        // Important: do NOT try to auto-reverse here.
+        // The checkpoints list is already time-ordered (oldest -> newest). When we keep a buffer tail
+        // across deaths, heuristic reversing can flip the route incorrectly and break multi-death routes.
 
         rp.add(deathPos);
 
         // Collapse close-by support points to avoid spam.
         rp = simplifyClosePoints(rp, CHECKPOINT_MERGE_DIST);
 
-        routePoints = rp;
-        routeDim = gp.dimension();
-        routeIndex = 0;
+        // Build a graph from the captured "support points".
+        GraphRoute gr = GraphRoute.build(rp);
 
-        // Build a graph from the captured "support points" and precompute shortest paths to death.
-        graphRoute = GraphRoute.build(rp);
+        // Queue semantics: first death first.
+        DeathRoute dr = new DeathRoute(rp, gp.dimension(), gr, gp);
+        deathQueue.addLast(dr);
+        if (activeRoute == null) activeRoute = dr;
 
         lastCapturedDeath = gp;
         lastCapturedDeathTick = (mc.level != null) ? mc.level.getGameTime() : lastCapturedDeathTick;
@@ -314,87 +375,53 @@ ClientTickEvents.END_CLIENT_TICK.register(DeathBreadcrumbsClient::onClientTick);
         checkpointsSnapshot = null;
         checkpointsSnapshotDim = null;
 
+        // Start a new recording segment for the new life, but keep a short tail so
+        // a quick re-death still has enough support points.
+        checkpointSegmentStart = Math.max(0, checkpoints.size() - CHECKPOINT_TAIL_ON_RESET);
+        checkpointSegmentId++;
+        lastDbPointId = null;
+        // Reset throttling so points after respawn are not artificially sparse.
+        lastCheckpointPos = null;
+        lastCheckpointTick = 0;
+
         // IMPORTANT: do NOT clear checkpoints here.
         // Reason: if the player reaches the death point, picks up loot, and dies again quickly,
         // we still need historical support points to build a new route.
 
         // Inform
         player.displayClientMessage(
-                Component.literal("[Death Breadcrumbs] Route captured: " + (rp.size() - 1) + " checkpoints, death at "
+                Component.literal("[Death Breadcrumbs] Route captured (#" + deathQueue.size() + "): "
+                        + (rp.size() - 1) + " checkpoints, death at "
                         + dp.getX() + " " + dp.getY() + " " + dp.getZ()),
                 false
         );
     }
 
     private static void renderBreadcrumbs(Level level, LocalPlayer player) {
-        if (routePoints == null || routePoints.isEmpty() || routeDim == null) return;
-        if (!level.dimension().equals(routeDim)) return;
+        if (activeRoute == null) return;
+        if (activeRoute.points == null || activeRoute.points.isEmpty() || activeRoute.dim == null) return;
+        if (!level.dimension().equals(activeRoute.dim)) return;
 
         Vec3 me = player.position();
 
-        Vec3 deathPos = routePoints.get(routePoints.size() - 1);
+        Vec3 deathPos = activeRoute.points.get(activeRoute.points.size() - 1);
+
+        // Always show a distinct marker at the final target.
+        spawnGoalMarker(level, deathPos);
 
         // If we reached the death point, clear the route.
         // Use horizontal distance (X/Z) so different Y (stairs, cliffs, etc.) doesn't prevent clearing.
         if (distXZ(me, deathPos) <= DEATH_REACHED_RADIUS) {
-            clearRoute();
+            advanceToNextDeathOrClear();
             return;
         }
 
-        // If we are already close to the death point, hide breadcrumbs.
+        // If we are already close to the death point, hide breadcrumbs (but keep the goal marker).
         if (distXZ(me, deathPos) <= DEATH_HIDE_RADIUS) return;
 
-        // If the player deviated far from the recorded trail (cut corners, teleported locally, etc.),
-        // add a "bridge" node near the player and rebuild the graph so breadcrumbs remain visible.
-        if (graphRoute != null && routePoints != null && routePoints.size() >= 2) {
-            Vec3 nearest = graphRoute.nodes.get(findClosestIndex(graphRoute.nodes, me));
-            double dNearest = distXZ(me, nearest);
-            long tickNow = level.getGameTime();
-
-            boolean far = dNearest > OFF_ROUTE_DIST;
-            boolean stepped = (lastBridgePos == null) || (distXZ(me, lastBridgePos) >= BRIDGE_STEP_DIST);
-            boolean cooldown = (tickNow - lastBridgeTick) >= BRIDGE_MIN_TICKS;
-
-            if (far && stepped && cooldown) {
-                Vec3 bridge = new Vec3(me.x, me.y, me.z);
-
-                // Insert right before death node (death is always the last node).
-                int insertAt = Math.max(0, routePoints.size() - 1);
-                routePoints.add(insertAt, bridge);
-
-                // Locally collapse duplicates near the insertion to avoid spam.
-                routePoints = simplifyClosePoints(routePoints, CHECKPOINT_MERGE_DIST);
-
-                // Rebuild graph so pathFrom() starts near the player again.
-                graphRoute = GraphRoute.build(routePoints);
-
-                // Also keep the checkpoint history for future deaths (same dimension only).
-                if (routeDim != null) {
-                    if (checkpointsDim == null) checkpointsDim = routeDim;
-                    if (checkpointsDim.equals(routeDim)) {
-                    if (!checkpoints.isEmpty() && distXZ(checkpoints.get(checkpoints.size() - 1), bridge) <= CHECKPOINT_MERGE_DIST) {
-                        checkpoints.set(checkpoints.size() - 1, bridge);
-                    } else {
-                        checkpoints.add(bridge);
-                    }
-                    // cap
-                    while (checkpoints.size() > CHECKPOINT_MAX_COUNT) {
-                        checkpoints.remove(0);
-                        checkpointSegmentStart = Math.max(0, checkpointSegmentStart - 1);
-                    }
-                    saveDirty = true;
-                    }
-                }
-
-                lastBridgePos = bridge;
-                lastBridgeTick = tickNow;
-            }
-        }
-
-
         // Preferred: graph-based shortest path over "support points".
-        if (graphRoute != null) {
-            GraphRoute.Path path = graphRoute.pathFrom(me, CRUMBS_COUNT);
+        if (activeRoute.graph != null) {
+            BreadcrumbPath path = activeRoute.graph.pathFrom(me, CRUMBS_COUNT);
             if (path != null) {
                 // Draw particles only at support points (graph nodes).
                 for (int i = 0; i < path.points.size(); i++) {
@@ -404,25 +431,136 @@ ClientTickEvents.END_CLIENT_TICK.register(DeathBreadcrumbsClient::onClientTick);
                     spawnCrumb(level, p);
                 }
                 // Keep routeIndex mostly meaningful for /status.
-                routeIndex = path.startNodeIndex;
+                activeRoute.routeIndex = path.startNodeIndex;
                 return;
             }
         }
 
         // Fallback: old linear waypoints logic.
-        int closest = findClosestIndex(routePoints, me);
-        if (closest > routeIndex) routeIndex = closest;
-        while (routeIndex < routePoints.size() - 1) {
-            Vec3 next = routePoints.get(routeIndex);
-            if (me.distanceTo(next) <= ADVANCE_DIST) routeIndex++;
+        int closest = findClosestIndex(activeRoute.points, me);
+        if (closest > activeRoute.routeIndex) activeRoute.routeIndex = closest;
+        while (activeRoute.routeIndex < activeRoute.points.size() - 1) {
+            Vec3 next = activeRoute.points.get(activeRoute.routeIndex);
+            if (me.distanceTo(next) <= ADVANCE_DIST) activeRoute.routeIndex++;
             else break;
         }
-        int start = Math.max(0, Math.min(routeIndex, routePoints.size() - 1));
-        int end = Math.min(routePoints.size(), start + CRUMBS_COUNT);
+        int start = Math.max(0, Math.min(activeRoute.routeIndex, activeRoute.points.size() - 1));
+        int end = Math.min(activeRoute.points.size(), start + CRUMBS_COUNT);
         for (int i = start; i < end; i++) {
-            Vec3 p = routePoints.get(i);
+            Vec3 p = activeRoute.points.get(i);
             spawnCrumb(level, p);
         }
+    }
+
+    /**
+     * Spawns "Bad Omen"-like particles around the death point so the player can always
+     * see the final goal, even if the breadcrumb trail is temporarily hidden.
+     */
+    private static void spawnGoalMarker(Level level, Vec3 deathPos) {
+        // Small vertical column + ring swirl.
+        for (int i = 0; i < GOAL_PARTICLES_PER_TICK; i++) {
+            double a = (Math.random() * Math.PI * 2.0);
+            double r = GOAL_RING_RADIUS * (0.35 + (Math.random() * 0.65));
+            double x = deathPos.x + Math.cos(a) * r;
+            double z = deathPos.z + Math.sin(a) * r;
+            double y = deathPos.y + 0.15 + (Math.random() * 1.6);
+
+            // For ENTITY_EFFECT, the (dx,dy,dz) parameters act as RGB on the client.
+            spawnEffectParticle(level, x, y, z, GOAL_R, GOAL_G, GOAL_B);
+        }
+    }
+
+    private static void spawnEffectParticle(Level level, double x, double y, double z, double r, double g, double b) {
+        net.minecraft.core.particles.ParticleOptions opts = createEntityEffectOptions(r, g, b);
+
+        if (level instanceof ClientLevel cl && opts != null) {
+            // Prefer: addParticle(ParticleOptions, force=true, x,y,z, dx,dy,dz)
+            try {
+                java.lang.reflect.Method m = cl.getClass().getMethod(
+                        "addParticle",
+                        net.minecraft.core.particles.ParticleOptions.class,
+                        boolean.class,
+                        double.class, double.class, double.class,
+                        double.class, double.class, double.class
+                );
+                m.invoke(cl, opts, true, x, y, z, 0.0, 0.0, 0.0);
+                return;
+            } catch (Throwable ignored) {
+            }
+
+            // Fallback: addAlwaysVisibleParticle(ParticleOptions, x,y,z, dx,dy,dz)
+            try {
+                java.lang.reflect.Method m = cl.getClass().getMethod(
+                        "addAlwaysVisibleParticle",
+                        net.minecraft.core.particles.ParticleOptions.class,
+                        double.class, double.class, double.class,
+                        double.class, double.class, double.class
+                );
+                m.invoke(cl, opts, x, y, z, 0.0, 0.0, 0.0);
+                return;
+            } catch (Throwable ignored) {
+            }
+
+            // Fallback: regular addParticle(ParticleOptions, x,y,z, dx,dy,dz)
+            try {
+                cl.addParticle(opts, x, y, z, 0.0, 0.0, 0.0);
+                return;
+            } catch (Throwable ignored) {
+            }
+        }
+
+        // Fallback if ENTITY_EFFECT is not available / mappings differ.
+        level.addParticle(ParticleTypes.END_ROD, x, y, z, 0, 0, 0);
+    }
+
+    /**
+     * Build ParticleOptions for ParticleTypes.ENTITY_EFFECT.
+     * Different MC versions expose this either via ColorParticleOption.create(...) or a constructor.
+     * We use reflection so the project compiles across mappings.
+     */
+    private static net.minecraft.core.particles.ParticleOptions createEntityEffectOptions(double r, double g, double b) {
+        try {
+            Class<?> c = Class.forName("net.minecraft.core.particles.ColorParticleOption");
+
+            // Try static create(ParticleType, float,float,float)
+            try {
+                java.lang.reflect.Method m = c.getMethod(
+                        "create",
+                        net.minecraft.core.particles.ParticleType.class,
+                        float.class, float.class, float.class
+                );
+                Object o = m.invoke(null, ParticleTypes.ENTITY_EFFECT, (float) r, (float) g, (float) b);
+                return (net.minecraft.core.particles.ParticleOptions) o;
+            } catch (Throwable ignored) {
+            }
+
+            // Try static create(ParticleType, float,float,float,float)
+            try {
+                java.lang.reflect.Method m = c.getMethod(
+                        "create",
+                        net.minecraft.core.particles.ParticleType.class,
+                        float.class, float.class, float.class, float.class
+                );
+                Object o = m.invoke(null, ParticleTypes.ENTITY_EFFECT, (float) r, (float) g, (float) b, 1.0f);
+                return (net.minecraft.core.particles.ParticleOptions) o;
+            } catch (Throwable ignored) {
+            }
+
+            // Try constructor(float,float,float) or (float,float,float,float)
+            for (java.lang.reflect.Constructor<?> ctor : c.getConstructors()) {
+                Class<?>[] p = ctor.getParameterTypes();
+                if (p.length == 3 && p[0] == float.class && p[1] == float.class && p[2] == float.class) {
+                    Object o = ctor.newInstance((float) r, (float) g, (float) b);
+                    return (net.minecraft.core.particles.ParticleOptions) o;
+                }
+                if (p.length == 4 && p[0] == float.class && p[1] == float.class && p[2] == float.class && p[3] == float.class) {
+                    Object o = ctor.newInstance((float) r, (float) g, (float) b, 1.0f);
+                    return (net.minecraft.core.particles.ParticleOptions) o;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     /**
@@ -488,25 +626,39 @@ ClientTickEvents.END_CLIENT_TICK.register(DeathBreadcrumbsClient::onClientTick);
 
 
     private static boolean isRouteActive() {
-        return routePoints != null && !routePoints.isEmpty() && routeDim != null;
+        return activeRoute != null;
     }
 
     private static boolean isReturningToDeath() {
         return isRouteActive() || pendingDeathCapture;
     }
 
+    /**
+     * Called when the player reaches the current death point.
+     * If there are more outstanding deaths, switch to the next one.
+     */
+    private static void advanceToNextDeathOrClear() {
+        if (!deathQueue.isEmpty()) deathQueue.removeFirst();
+        activeRoute = deathQueue.peekFirst();
+        if (activeRoute == null) {
+            // No more targets.
+            // Soft-reset the checkpoint segment so very old trails don't interfere with the next death route.
+            checkpointSegmentStart = Math.max(0, checkpoints.size() - CHECKPOINT_TAIL_ON_RESET);
+            checkpointSegmentId++;
+            lastDbPointId = null;
+            saveDirty = true;
+        }
+    }
+
     private static void clearRoute() {
-        routePoints = null;
-        routeDim = null;
-        routeIndex = 0;
-        graphRoute = null;
-        lastBridgePos = null;
-        lastBridgeTick = 0;
+        deathQueue.clear();
+        activeRoute = null;
         // We keep lastCapturedDeath so we don't re-capture the same death over and over.
 
-        // Soft-reset the checkpoint segment so very old trails don't interfere with the next death route.
-        // Keep a small tail to allow an immediate second death right after picking up loot.
+        // Same cleanup as when finishing the last target.
         checkpointSegmentStart = Math.max(0, checkpoints.size() - CHECKPOINT_TAIL_ON_RESET);
+        checkpointSegmentId++;
+        lastDbPointId = null;
         saveDirty = true;
     }
 
@@ -670,13 +822,6 @@ ClientTickEvents.END_CLIENT_TICK.register(DeathBreadcrumbsClient::onClientTick);
         }
     }
 
-    private static final class SaveData {
-        String dimension;
-        double[][] checkpoints;
-        double[] lastCheckpointPos;
-        long lastCheckpointTick;
-        int checkpointSegmentStart;
-    }
 
 // --- Commands ---
     private static int cmdClear(CommandContext<?> ctx) {
@@ -687,6 +832,10 @@ ClientTickEvents.END_CLIENT_TICK.register(DeathBreadcrumbsClient::onClientTick);
         checkpointsDim = null;
         lastCheckpointPos = null;
         lastCheckpointTick = 0;
+        checkpointSegmentStart = 0;
+
+        checkpointSegmentId++;
+        lastDbPointId = null;
 
         clearRoute();
 
@@ -711,11 +860,14 @@ ClientTickEvents.END_CLIENT_TICK.register(DeathBreadcrumbsClient::onClientTick);
         if (mc.player == null) return 1;
 
         int cp = checkpoints.size();
-        int rp = (routePoints == null) ? 0 : routePoints.size();
-        String dim = (routeDim == null) ? "none" : String.valueOf(routeDim);
+        int pending = deathQueue.size();
+        int rp = (activeRoute == null || activeRoute.points == null) ? 0 : activeRoute.points.size();
+        String dim = (activeRoute == null || activeRoute.dim == null) ? "none" : String.valueOf(activeRoute.dim);
+        int idx = (activeRoute == null) ? 0 : activeRoute.routeIndex;
+        boolean hasGraph = activeRoute != null && activeRoute.graph != null;
 
         mc.player.displayClientMessage(
-			Component.literal("[Death Breadcrumbs] checkpoints=" + cp + ", routePoints=" + rp + ", routeDim=" + dim + ", routeIndex=" + routeIndex + ", graph=" + (graphRoute != null)),
+			Component.literal("[Death Breadcrumbs] checkpoints=" + cp + ", deathsQueued=" + pending + ", activeRoutePoints=" + rp + ", activeDim=" + dim + ", routeIndex=" + idx + ", graph=" + hasGraph),
 			false
 		);
         return 1;
@@ -726,146 +878,4 @@ ClientTickEvents.END_CLIENT_TICK.register(DeathBreadcrumbsClient::onClientTick);
      * (plus sequential edges), then runs Dijkstra from the death node (last point) to all nodes.
      * This gives a stable "follow the shortest path" behavior even if the player deviates.
      */
-    private static final class GraphRoute {
-        private final List<Vec3> nodes;
-        private final int deathIdx;
-        private final int[][] neighbors;
-        private final double[][] weights;
-
-        // For each node i: next hop towards death (or -1)
-        private final int[] nextTowardDeath;
-
-        private GraphRoute(List<Vec3> nodes, int[][] neighbors, double[][] weights, int[] nextTowardDeath) {
-            this.nodes = nodes;
-            this.deathIdx = nodes.size() - 1;
-            this.neighbors = neighbors;
-            this.weights = weights;
-            this.nextTowardDeath = nextTowardDeath;
-        }
-
-        static GraphRoute build(List<Vec3> points) {
-            if (points == null || points.size() < 2) return null;
-
-            int n = points.size();
-            double maxEdge2 = GRAPH_MAX_EDGE_DIST * GRAPH_MAX_EDGE_DIST;
-
-            // 1) For each node, pick K nearest neighbors (within max distance).
-            int[][] neigh = new int[n][];
-            double[][] w = new double[n][];
-
-            for (int i = 0; i < n; i++) {
-                Integer[] idx = new Integer[n - 1];
-                int t = 0;
-                Vec3 a = points.get(i);
-                for (int j = 0; j < n; j++) {
-                    if (j == i) continue;
-                    idx[t++] = j;
-                }
-                Arrays.sort(idx, Comparator.comparingDouble(j -> dist2(a, points.get(j))));
-
-                int cap = Math.min(GRAPH_K_NEIGHBORS, idx.length);
-                int[] tmpN = new int[cap + 2];
-                double[] tmpW = new double[cap + 2];
-                int m = 0;
-                for (int k = 0; k < cap; k++) {
-                    int j = idx[k];
-                    double d2 = dist2(a, points.get(j));
-                    if (d2 > maxEdge2) continue;
-                    tmpN[m] = j;
-                    tmpW[m] = Math.sqrt(d2);
-                    m++;
-                }
-
-                // 2) Always connect to sequential neighbors if present (keeps the recorded trail usable)
-                if (i - 1 >= 0) {
-                    tmpN[m] = i - 1;
-                    tmpW[m] = a.distanceTo(points.get(i - 1));
-                    m++;
-                }
-                if (i + 1 < n) {
-                    tmpN[m] = i + 1;
-                    tmpW[m] = a.distanceTo(points.get(i + 1));
-                    m++;
-                }
-
-                neigh[i] = Arrays.copyOf(tmpN, m);
-                w[i] = Arrays.copyOf(tmpW, m);
-            }
-
-            // 3) Dijkstra from death node (last point): compute next hop towards death for each node.
-            int death = n - 1;
-            double[] dist = new double[n];
-            int[] next = new int[n];
-            Arrays.fill(dist, Double.POSITIVE_INFINITY);
-            Arrays.fill(next, -1);
-            dist[death] = 0.0;
-
-            PriorityQueue<long[]> pq = new PriorityQueue<>(Comparator.comparingDouble(a -> Double.longBitsToDouble(a[1])));
-            pq.add(new long[]{death, Double.doubleToRawLongBits(0.0)});
-
-            while (!pq.isEmpty()) {
-                long[] cur = pq.poll();
-                int u = (int) cur[0];
-                double du = Double.longBitsToDouble(cur[1]);
-                if (du != dist[u]) continue;
-
-                int[] nu = neigh[u];
-                double[] wu = w[u];
-                for (int ei = 0; ei < nu.length; ei++) {
-                    int v = nu[ei];
-                    double nd = du + wu[ei];
-                    if (nd < dist[v]) {
-                        dist[v] = nd;
-                        // From v, the next step towards death is u (because u is closer to death).
-                        next[v] = u;
-                        pq.add(new long[]{v, Double.doubleToRawLongBits(nd)});
-                    }
-                }
-            }
-
-            return new GraphRoute(points, neigh, w, next);
-        }
-
-        Path pathFrom(Vec3 position, int maxCrumbs) {
-            if (nodes == null || nodes.isEmpty()) return null;
-            int start = findClosestIndex(nodes, position);
-
-            ArrayList<Vec3> crumbs = new ArrayList<>(maxCrumbs);
-            int cur = start;
-            int safety = nodes.size() + 5;
-
-            while (crumbs.size() < maxCrumbs && safety-- > 0) {
-                // Only show particles at support points (graph nodes), not along segments.
-                Vec3 here = nodes.get(cur);
-                crumbs.add(new Vec3(here.x, here.y, here.z));
-
-                if (cur == deathIdx) break;
-
-                int nxt = nextTowardDeath[cur];
-                if (nxt < 0 || nxt == cur) break;
-                cur = nxt;
-            }
-
-            if (crumbs.isEmpty()) return null;
-            return new Path(start, crumbs);
-        }
-
-
-        private static double dist2(Vec3 a, Vec3 b) {
-            double dx = a.x - b.x;
-            double dy = a.y - b.y;
-            double dz = a.z - b.z;
-            return dx * dx + dy * dy + dz * dz;
-        }
-
-        private static final class Path {
-            final int startNodeIndex;
-            final List<Vec3> points;
-
-            Path(int startNodeIndex, List<Vec3> points) {
-                this.startNodeIndex = startNodeIndex;
-                this.points = points;
-            }
-        }
-    }
 }
