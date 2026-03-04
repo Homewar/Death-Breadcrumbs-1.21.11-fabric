@@ -270,15 +270,44 @@ ClientTickEvents.END_CLIENT_TICK.register(DeathBreadcrumbsClient::onClientTick);
             return;
         }
 
-        double dist = pos.distanceTo(lastCheckpointPos);
+        double distXZ = horizontalDistance(pos, lastCheckpointPos);
         long dt = tick - lastCheckpointTick;
 
-        if (dist >= CHECKPOINT_MIN_DIST || dt >= CHECKPOINT_MAX_INTERVAL_TICKS) {
-            // Collapse close-by points instead of adding a new one.
-            if (!checkpoints.isEmpty() && dist <= CHECKPOINT_MERGE_DIST) {
+        if (distXZ >= CHECKPOINT_MIN_DIST || dt >= CHECKPOINT_MAX_INTERVAL_TICKS) {
+            // Collapse points:
+            //  1) If we're still very close to the last checkpoint, just replace it.
+            //  2) If we returned close to an earlier checkpoint (self-cross / small loop),
+            //     snap to it and drop the tail. This prevents "spaghetti" trails and
+            //     makes routes stable regardless of checkpoint order/jitter.
+            boolean collapsed = false;
+
+            if (!checkpoints.isEmpty() && distXZ <= CHECKPOINT_MERGE_DIST) {
                 checkpoints.set(checkpoints.size() - 1, pos);
+                collapsed = true;
                 saveDirty = true;
-            } else {
+            } else if (checkpoints.size() >= 3) {
+                // Look back a bit for a nearby point to merge into.
+                final int LOOKBACK = 80;
+                int startIdx = Math.max(0, checkpoints.size() - 1 - LOOKBACK);
+                int foundIdx = -1;
+                for (int i = checkpoints.size() - 2; i >= startIdx; i--) {
+                    if (horizontalDistance(pos, checkpoints.get(i)) <= CHECKPOINT_MERGE_DIST) {
+                        foundIdx = i;
+                        break;
+                    }
+                }
+                if (foundIdx >= 0) {
+                    checkpoints.set(foundIdx, pos);
+                    // Remove everything after foundIdx (collapse the loop).
+                    while (checkpoints.size() > foundIdx + 1) {
+                        checkpoints.remove(checkpoints.size() - 1);
+                    }
+                    collapsed = true;
+                    saveDirty = true;
+                }
+            }
+
+            if (!collapsed) {
                 checkpoints.add(pos);
                 saveDirty = true;
             }
@@ -871,6 +900,15 @@ ClientTickEvents.END_CLIENT_TICK.register(DeathBreadcrumbsClient::onClientTick);
 			false
 		);
         return 1;
+    }
+
+    /**
+     * Horizontal (XZ) distance between two positions. Y is ignored.
+     */
+    private static double horizontalDistance(Vec3 a, Vec3 b) {
+        double dx = a.x - b.x;
+        double dz = a.z - b.z;
+        return Math.sqrt(dx * dx + dz * dz);
     }
 
     /**
